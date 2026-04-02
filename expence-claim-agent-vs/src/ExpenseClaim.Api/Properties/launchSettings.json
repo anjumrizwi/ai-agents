@@ -8,8 +8,8 @@
       "applicationUrl": "http://localhost:5278",
       "environmentVariables": {
         "ASPNETCORE_ENVIRONMENT": "Development",
-        "AZURE_FOUNDRY_PROJECT_ENDPOINT": "",
-        "AZURE_FOUNDRY_PROJECT_DEPLOYMENT_NAME": ""
+        "AZURE_FOUNDRY_PROJECT_ENDPOINT": "https://prj-expence-claim-resource.services.ai.azure.com/api/projects/prj-expence-claim",
+        "AZURE_FOUNDRY_PROJECT_DEPLOYMENT_NAME": "gpt-4o"
       }
     }
   }
