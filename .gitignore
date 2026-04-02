@@ -1,0 +1,13 @@
+/expence-claim-agent-vs/.vs
+/expence-claim-agent-vs/src/ExpenseClaim.Api/bin
+/expence-claim-agent-vs/src/ExpenseClaim.Api/obj
+/expence-claim-agent-vs/src/ExpenseClaim.Application/bin
+/expence-claim-agent-vs/src/ExpenseClaim.Application/obj
+/expence-claim-agent-vs/src/ExpenseClaim.Domain/obj
+/expence-claim-agent-vs/src/ExpenseClaim.Domain/bin
+/expence-claim-agent-vs/src/ExpenseClaim.Infrastructure/bin
+/expence-claim-agent-vs/src/ExpenseClaim.Infrastructure/obj
+/expence-claim-agent-vs/src/ExpenseClaim.Worker/bin
+/expence-claim-agent-vs/src/ExpenseClaim.Worker/obj
+/expence-claim-agent-vs/tests/ExpenseClaim.Tests/bin
+/expence-claim-agent-vs/tests/ExpenseClaim.Tests/obj

@@ -1,0 +1,3 @@
+Claimant Email: fred@contoso.com
+Description: Breakfast expense
+Amount: $20.00
