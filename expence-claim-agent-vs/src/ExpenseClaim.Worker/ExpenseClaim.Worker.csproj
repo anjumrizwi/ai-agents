@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk.Worker">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UserSecretsId>dotnet-ExpenseClaim.Worker-f21c61b2-4b99-4783-bda5-d9458d08901d</UserSecretsId>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.5" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\ExpenseClaim.Application\ExpenseClaim.Application.csproj" />
+    <ProjectReference Include="..\ExpenseClaim.Infrastructure\ExpenseClaim.Infrastructure.csproj" />
+  </ItemGroup>
+</Project>
