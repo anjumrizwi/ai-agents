@@ -1,13 +1,40 @@
 using System.Text.Json;
+using System.Collections.Concurrent;
+using System.Threading;
 using Azure.AI.Projects;
 using Azure.Identity;
 using Microsoft.Agents.AI;
+
+const string ExpensePolicyFileName = "expense-policy.txt";
+const string FoundryEndpointEnvVar = "AZURE_FOUNDRY_PROJECT_ENDPOINT";
+const string FoundryDeploymentEnvVar = "AZURE_FOUNDRY_PROJECT_DEPLOYMENT_NAME";
+const string FoundryEndpointConfigKey = "AzureAiFoundry:ProjectEndpoint";
+const string FoundryDeploymentConfigKey = "AzureAiFoundry:DeploymentName";
+
+var expenseDraftJsonOptions = new JsonSerializerOptions
+{
+    PropertyNameCaseInsensitive = true
+};
 
 var builder = WebApplication.CreateBuilder(args);
 
 // Add services to the container.
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
+builder.Services.AddSingleton<Func<AIProjectClient?>>(serviceProvider =>
+{
+    var configuration = serviceProvider.GetRequiredService<IConfiguration>();
+
+    return () =>
+    {
+        var endpoint = Environment.GetEnvironmentVariable(FoundryEndpointEnvVar)
+            ?? configuration[FoundryEndpointConfigKey];
+
+        return string.IsNullOrWhiteSpace(endpoint)
+            ? null
+            : new AIProjectClient(new Uri(endpoint), new DefaultAzureCredential());
+    };
+});
 
 var app = builder.Build();
 
@@ -18,44 +45,55 @@ if (app.Environment.IsDevelopment())
     app.UseSwaggerUI();
 }
 
-var expenses = new List<Expense>
-{
-    new(1, "Taxi", 35.50m, DateOnly.FromDateTime(DateTime.UtcNow.Date), "Travel")
-};
+var seedExpense = new Expense(1, "Taxi", 35.50m, DateOnly.FromDateTime(DateTime.UtcNow.Date), "Travel");
+var expenses = new ConcurrentDictionary<int, Expense>();
+expenses.TryAdd(seedExpense.Id, seedExpense);
+var nextExpenseId = seedExpense.Id;
 
-var policyFilePath = Path.Combine(app.Environment.ContentRootPath, "expense-policy.txt");
+var policyFilePath = Path.Combine(app.Environment.ContentRootPath, ExpensePolicyFileName);
 var expensePolicyText = File.Exists(policyFilePath)
     ? File.ReadAllText(policyFilePath)
     : string.Empty;
+var policyRules = ParsePolicyRules(expensePolicyText);
 
 app.MapGet("/", () => Results.Ok(new { message = "ExpenseClaim API is running", endpoints = new[] { "/api/expenses" } }));
 
 var expenseRoutes = app.MapGroup("/api/expenses");
 
-expenseRoutes.MapGet("/", () => Results.Ok(expenses));
+expenseRoutes.MapGet("/", () => Results.Ok(expenses.Values.OrderBy(x => x.Id)));
 
 expenseRoutes.MapGet("/{id:int}", (int id) =>
 {
-    var expense = expenses.FirstOrDefault(x => x.Id == id);
-    return expense is null ? Results.NotFound() : Results.Ok(expense);
+    return expenses.TryGetValue(id, out var expense)
+        ? Results.Ok(expense)
+        : Results.NotFound();
 });
 
 expenseRoutes.MapPost("/", (CreateExpenseRequest request) =>
 {
-    var nextId = expenses.Count == 0 ? 1 : expenses.Max(x => x.Id) + 1;
+    if (TryGetPolicyViolation(policyRules, request.Description, request.Category, request.Amount, out var postViolation))
+    {
+        return Results.BadRequest(new
+        {
+            error = $"{postViolation.PolicyCategory} expense exceeds policy limit.",
+            policy = postViolation.PolicyLine,
+            limit = postViolation.Limit
+        });
+    }
+
+    var nextId = Interlocked.Increment(ref nextExpenseId);
     var expense = new Expense(nextId, request.Description, request.Amount, request.ExpenseDate, request.Category);
-    expenses.Add(expense);
+    expenses[nextId] = expense;
     return Results.Created($"/api/expenses/{expense.Id}", expense);
 });
 
-expenseRoutes.MapPost("/ai", async (CreateExpenseFromTextRequest request) =>
+expenseRoutes.MapPost("/ai", async (CreateExpenseFromTextRequest request, Func<AIProjectClient?> projectClientFactory) =>
 {
-    var endpoint = Environment.GetEnvironmentVariable("AZURE_FOUNDRY_PROJECT_ENDPOINT")
-        ?? builder.Configuration["AzureAiFoundry:ProjectEndpoint"];
-    var deploymentName = Environment.GetEnvironmentVariable("AZURE_FOUNDRY_PROJECT_DEPLOYMENT_NAME")
-        ?? builder.Configuration["AzureAiFoundry:DeploymentName"];
+    var projectClient = projectClientFactory();
+    var deploymentName = Environment.GetEnvironmentVariable(FoundryDeploymentEnvVar)
+        ?? builder.Configuration[FoundryDeploymentConfigKey];
 
-    if (string.IsNullOrWhiteSpace(endpoint) || string.IsNullOrWhiteSpace(deploymentName))
+    if (projectClient is null || string.IsNullOrWhiteSpace(deploymentName))
     {
         return Results.BadRequest(new
         {
@@ -72,8 +110,6 @@ expenseRoutes.MapPost("/ai", async (CreateExpenseFromTextRequest request) =>
 
     try
     {
-        var projectClient = new AIProjectClient(new Uri(endpoint), new DefaultAzureCredential());
-
         if (LooksLikePolicyQuestion(request.Text))
         {
             if (string.IsNullOrWhiteSpace(expensePolicyText))
@@ -81,7 +117,7 @@ expenseRoutes.MapPost("/ai", async (CreateExpenseFromTextRequest request) =>
                 return Results.BadRequest(new
                 {
                     error = "Expense policy knowledge file is missing.",
-                    required = "expense-policy.txt"
+                    required = ExpensePolicyFileName
                 });
             }
 
@@ -137,7 +173,7 @@ expenseRoutes.MapPost("/ai", async (CreateExpenseFromTextRequest request) =>
         ExpenseDraft? draft;
         try
         {
-            draft = JsonSerializer.Deserialize<ExpenseDraft>(json, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+            draft = JsonSerializer.Deserialize<ExpenseDraft>(json, expenseDraftJsonOptions);
         }
         catch (JsonException)
         {
@@ -158,37 +194,38 @@ expenseRoutes.MapPost("/ai", async (CreateExpenseFromTextRequest request) =>
             expenseDate = DateOnly.FromDateTime(DateTime.UtcNow.Date);
         }
 
-        if (TryGetPolicyLimit(expensePolicyText, draft, out var limit, out var policyCategory) && draft.Amount > limit)
+        if (TryGetPolicyViolation(policyRules, draft.Description, draft.Category, draft.Amount, out var aiViolation))
         {
             return Results.BadRequest(new
             {
-                error = $"{policyCategory} expense exceeds policy limit.",
-                policy = GetPolicyLineForCategory(expensePolicyText, policyCategory),
-                limit
+                error = $"{aiViolation.PolicyCategory} expense exceeds policy limit.",
+                policy = aiViolation.PolicyLine,
+                limit = aiViolation.Limit
             });
         }
 
-        var nextId = expenses.Count == 0 ? 1 : expenses.Max(x => x.Id) + 1;
+        var nextId = Interlocked.Increment(ref nextExpenseId);
         var expense = new Expense(nextId, draft.Description, draft.Amount, expenseDate, draft.Category);
-        expenses.Add(expense);
+        expenses[nextId] = expense;
 
         return Results.Created($"/api/expenses/{expense.Id}", expense);
     }
     catch (Exception ex)
     {
-        return Results.Problem($"AI expense extraction failed: {ex.Message}");
+        Console.Error.WriteLine(ex);
+        return Results.Problem("AI expense extraction failed.");
     }
     finally
     {
-        if (agent is not null)
+        if (agent is not null && projectClient is not null)
         {
             try
             {
-                var projectClient = new AIProjectClient(new Uri(endpoint), new DefaultAzureCredential());
                 await projectClient.Agents.DeleteAgentAsync(agent.Name);
             }
-            catch
+            catch (Exception cleanupEx)
             {
+                Console.Error.WriteLine(cleanupEx);
             }
         }
     }
@@ -196,26 +233,36 @@ expenseRoutes.MapPost("/ai", async (CreateExpenseFromTextRequest request) =>
 
 expenseRoutes.MapPut("/{id:int}", (int id, UpdateExpenseRequest request) =>
 {
-    var index = expenses.FindIndex(x => x.Id == id);
-    if (index < 0)
+    if (TryGetPolicyViolation(policyRules, request.Description, request.Category, request.Amount, out var putViolation))
     {
-        return Results.NotFound();
+        return Results.BadRequest(new
+        {
+            error = $"{putViolation.PolicyCategory} expense exceeds policy limit.",
+            policy = putViolation.PolicyLine,
+            limit = putViolation.Limit
+        });
     }
 
-    expenses[index] = new Expense(id, request.Description, request.Amount, request.ExpenseDate, request.Category);
-    return Results.NoContent();
+    while (true)
+    {
+        if (!expenses.TryGetValue(id, out var existingExpense))
+        {
+            return Results.NotFound();
+        }
+
+        var updatedExpense = new Expense(id, request.Description, request.Amount, request.ExpenseDate, request.Category);
+        if (expenses.TryUpdate(id, updatedExpense, existingExpense))
+        {
+            return Results.NoContent();
+        }
+    }
 });
 
 expenseRoutes.MapDelete("/{id:int}", (int id) =>
 {
-    var index = expenses.FindIndex(x => x.Id == id);
-    if (index < 0)
-    {
-        return Results.NotFound();
-    }
-
-    expenses.RemoveAt(index);
-    return Results.NoContent();
+    return expenses.TryRemove(id, out _)
+        ? Results.NoContent()
+        : Results.NotFound();
 });
 
 app.Run();
@@ -244,13 +291,7 @@ static bool LooksLikePolicyQuestion(string text)
         || lower.Contains("policy");
 }
 
-static bool IsMealCategory(string category)
-{
-    var normalized = category.Trim().ToLowerInvariant();
-    return normalized is "meal" or "meals" or "breakfast" or "lunch" or "dinner";
-}
-
-static bool TryGetPolicyLimit(string policyText, ExpenseDraft draft, out decimal limit, out string policyCategory)
+static bool TryGetPolicyLimit(IReadOnlyDictionary<string, PolicyRule> policyRules, ExpenseDraft draft, out decimal limit, out string policyCategory)
 {
     limit = 0m;
     policyCategory = string.Empty;
@@ -258,31 +299,31 @@ static bool TryGetPolicyLimit(string policyText, ExpenseDraft draft, out decimal
     var normalizedCategory = draft.Category.Trim().ToLowerInvariant();
     var normalizedDescription = draft.Description.Trim().ToLowerInvariant();
 
-    if (IsMatch(normalizedCategory, normalizedDescription, "meals", ["meal", "meals", "breakfast", "lunch", "dinner"]) && TryExtractPolicyAmount(policyText, "Meals", out limit))
+    if (IsMatch(normalizedCategory, normalizedDescription, "meals", ["meal", "meals", "breakfast", "lunch", "dinner"]) && TryGetPolicyCategoryLimit(policyRules, "Meals", out limit))
     {
         policyCategory = "Meals";
         return true;
     }
 
-    if (IsMatch(normalizedCategory, normalizedDescription, "flights", ["flight", "flights", "airfare"]) && TryExtractPolicyAmount(policyText, "Flights", out limit))
+    if (IsMatch(normalizedCategory, normalizedDescription, "flights", ["flight", "flights", "airfare"]) && TryGetPolicyCategoryLimit(policyRules, "Flights", out limit))
     {
         policyCategory = "Flights";
         return true;
     }
 
-    if (IsMatch(normalizedCategory, normalizedDescription, "taxis and rideshares", ["taxi", "rideshare", "uber", "lyft", "cab"]) && TryExtractPolicyAmount(policyText, "Taxis and Rideshares", out limit))
+    if (IsMatch(normalizedCategory, normalizedDescription, "taxis and rideshares", ["taxi", "rideshare", "uber", "lyft", "cab"]) && TryGetPolicyCategoryLimit(policyRules, "Taxis and Rideshares", out limit))
     {
         policyCategory = "Taxis and Rideshares";
         return true;
     }
 
-    if (IsMatch(normalizedCategory, normalizedDescription, "hotels", ["hotel", "lodging", "accommodation"]) && TryExtractPolicyAmount(policyText, "Hotels", out limit))
+    if (IsMatch(normalizedCategory, normalizedDescription, "hotels", ["hotel", "lodging", "accommodation"]) && TryGetPolicyCategoryLimit(policyRules, "Hotels", out limit))
     {
         policyCategory = "Hotels";
         return true;
     }
 
-    if (IsMatch(normalizedCategory, normalizedDescription, "other expenses", ["other", "misc", "miscellaneous"]) && TryExtractPolicyAmount(policyText, "Other expenses", out limit))
+    if (IsMatch(normalizedCategory, normalizedDescription, "other expenses", ["other", "misc", "miscellaneous"]) && TryGetPolicyCategoryLimit(policyRules, "Other expenses", out limit))
     {
         policyCategory = "Other expenses";
         return true;
@@ -297,19 +338,62 @@ static bool IsMatch(string category, string description, string categoryKeyword,
         || aliases.Any(a => category.Contains(a) || description.Contains(a));
 }
 
-static bool TryExtractPolicyAmount(string policyText, string categoryName, out decimal amount)
+static bool TryGetPolicyCategoryLimit(IReadOnlyDictionary<string, PolicyRule> policyRules, string categoryName, out decimal amount)
 {
-    amount = 0m;
-    if (string.IsNullOrWhiteSpace(policyText))
+    if (!policyRules.TryGetValue(categoryName, out var rule))
     {
+        amount = 0m;
         return false;
     }
 
-    var line = policyText
-        .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries)
-        .FirstOrDefault(l => l.Contains(categoryName, StringComparison.OrdinalIgnoreCase) && l.Contains('$'));
+    amount = rule.Limit;
+    return true;
+}
 
-    if (line is null)
+static IReadOnlyDictionary<string, PolicyRule> ParsePolicyRules(string policyText)
+{
+    var rules = new Dictionary<string, PolicyRule>(StringComparer.OrdinalIgnoreCase);
+    if (string.IsNullOrWhiteSpace(policyText))
+    {
+        return rules;
+    }
+
+    var lines = policyText
+        .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries)
+        .Select(line => line.Trim())
+        .ToArray();
+
+    var categories = new[]
+    {
+        "Meals",
+        "Flights",
+        "Taxis and Rideshares",
+        "Hotels",
+        "Other expenses"
+    };
+
+    foreach (var category in categories)
+    {
+        var line = lines.FirstOrDefault(l => l.Contains(category, StringComparison.OrdinalIgnoreCase) && l.Contains('$'));
+        if (line is null)
+        {
+            continue;
+        }
+
+        if (TryExtractPolicyAmountFromLine(line, out var limit))
+        {
+            rules[category] = new PolicyRule(limit, line);
+        }
+    }
+
+    return rules;
+}
+
+static bool TryExtractPolicyAmountFromLine(string line, out decimal amount)
+{
+    amount = 0m;
+
+    if (string.IsNullOrWhiteSpace(line))
     {
         return false;
     }
@@ -324,13 +408,26 @@ static bool TryExtractPolicyAmount(string policyText, string categoryName, out d
     return decimal.TryParse(valueChars, out amount);
 }
 
-static string GetPolicyLineForCategory(string policyText, string categoryName)
+static bool TryGetPolicyViolation(IReadOnlyDictionary<string, PolicyRule> policyRules, string description, string category, decimal amount, out PolicyViolation violation)
 {
-    return policyText
-        .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries)
-        .FirstOrDefault(l => l.Contains(categoryName, StringComparison.OrdinalIgnoreCase))
-        ?? "Policy limit configured.";
+    violation = default;
+    var draft = new ExpenseDraft(description, amount, string.Empty, category);
+    if (!TryGetPolicyLimit(policyRules, draft, out var limit, out var policyCategory) || amount <= limit)
+    {
+        return false;
+    }
+
+    var policyLine = policyRules.TryGetValue(policyCategory, out var policyRule)
+        ? policyRule.PolicyLine
+        : "Policy limit configured.";
+
+    violation = new PolicyViolation(policyCategory, limit, policyLine);
+    return true;
 }
+
+readonly record struct PolicyRule(decimal Limit, string PolicyLine);
+
+readonly record struct PolicyViolation(string PolicyCategory, decimal Limit, string PolicyLine);
 
 record Expense(int Id, string Description, decimal Amount, DateOnly ExpenseDate, string Category);
 

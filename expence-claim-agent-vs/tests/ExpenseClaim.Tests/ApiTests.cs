@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Http.Json;
 using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.Extensions.Configuration;
 
 namespace ExpenseClaim.Tests;
 
@@ -20,6 +21,66 @@ public class ApiTests
         Assert.NotNull(expenses);
         Assert.NotEmpty(expenses);
         Assert.Contains(expenses, e => e.Description == "Taxi" && e.Category == "Travel");
+    }
+
+    [Fact]
+    public async Task PostExpense_WhenMealExceedsPolicy_ReturnsBadRequest()
+    {
+        await using var factory = new WebApplicationFactory<Program>();
+        using var client = factory.CreateClient();
+
+        var payload = new
+        {
+            description = "Team dinner",
+            amount = 120.00m,
+            expenseDate = DateOnly.FromDateTime(DateTime.UtcNow.Date),
+            category = "Meals"
+        };
+
+        var response = await client.PostAsJsonAsync("/api/expenses", payload);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var error = await response.Content.ReadFromJsonAsync<PolicyViolationDto>();
+        Assert.NotNull(error);
+        Assert.Equal("Meals expense exceeds policy limit.", error!.Error);
+        Assert.Equal(90m, error.Limit);
+    }
+
+    [Fact]
+    public async Task PutExpense_WhenMealExceedsPolicy_ReturnsBadRequest()
+    {
+        await using var factory = new WebApplicationFactory<Program>();
+        using var client = factory.CreateClient();
+
+        var createPayload = new
+        {
+            description = "Taxi",
+            amount = 30.00m,
+            expenseDate = DateOnly.FromDateTime(DateTime.UtcNow.Date),
+            category = "Travel"
+        };
+
+        var createResponse = await client.PostAsJsonAsync("/api/expenses", createPayload);
+        Assert.Equal(HttpStatusCode.Created, createResponse.StatusCode);
+
+        var created = await createResponse.Content.ReadFromJsonAsync<ExpenseDto>();
+        Assert.NotNull(created);
+
+        var updatePayload = new
+        {
+            description = "Client lunch",
+            amount = 140.00m,
+            expenseDate = DateOnly.FromDateTime(DateTime.UtcNow.Date),
+            category = "Meals"
+        };
+
+        var updateResponse = await client.PutAsJsonAsync($"/api/expenses/{created!.Id}", updatePayload);
+
+        Assert.Equal(HttpStatusCode.BadRequest, updateResponse.StatusCode);
+        var error = await updateResponse.Content.ReadFromJsonAsync<PolicyViolationDto>();
+        Assert.NotNull(error);
+        Assert.Equal("Meals expense exceeds policy limit.", error!.Error);
+        Assert.Equal(90m, error.Limit);
     }
 
     [Fact]
@@ -102,17 +163,28 @@ public class ApiTests
     [Fact]
     public async Task PostExpenseAi_WhenConfigurationMissing_ReturnsBadRequest()
     {
-        await using var factory = new WebApplicationFactory<Program>();
-        using var client = factory.CreateClient();
-
         var previousEndpoint = Environment.GetEnvironmentVariable("AZURE_FOUNDRY_PROJECT_ENDPOINT");
         var previousDeployment = Environment.GetEnvironmentVariable("AZURE_FOUNDRY_PROJECT_DEPLOYMENT_NAME");
 
-        Environment.SetEnvironmentVariable("AZURE_FOUNDRY_PROJECT_ENDPOINT", null);
-        Environment.SetEnvironmentVariable("AZURE_FOUNDRY_PROJECT_DEPLOYMENT_NAME", null);
+        Environment.SetEnvironmentVariable("AZURE_FOUNDRY_PROJECT_ENDPOINT", string.Empty);
+        Environment.SetEnvironmentVariable("AZURE_FOUNDRY_PROJECT_DEPLOYMENT_NAME", string.Empty);
 
         try
         {
+            await using var factory = new WebApplicationFactory<Program>()
+                .WithWebHostBuilder(builder =>
+                {
+                    builder.ConfigureAppConfiguration((_, config) =>
+                    {
+                        config.AddInMemoryCollection(new Dictionary<string, string?>
+                        {
+                            ["AzureAiFoundry:ProjectEndpoint"] = string.Empty,
+                            ["AzureAiFoundry:DeploymentName"] = string.Empty
+                        });
+                    });
+                });
+            using var client = factory.CreateClient();
+
             var response = await client.PostAsJsonAsync("/api/expenses/ai", new { text = "I spent 20 on coffee" });
             Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
 
@@ -130,4 +202,6 @@ public class ApiTests
     private sealed record ExpenseDto(int Id, string Description, decimal Amount, DateOnly ExpenseDate, string Category);
 
     private sealed record ErrorDto(string Error);
+
+    private sealed record PolicyViolationDto(string Error, decimal Limit);
 }
